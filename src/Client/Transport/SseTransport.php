@@ -41,6 +41,7 @@ use Mcp\Types\JSONRPCResponse;
 use Mcp\Types\JSONRPCError;
 use Mcp\Types\RequestId;
 use Mcp\Types\JsonRpcErrorObject;
+use CurlHandle;
 
 /**
  * Class SseTransport
@@ -51,7 +52,7 @@ class SseTransport {
     /** @var resource|null */
     private $eventStream = null;
 
-    /** @var resource|null */
+    /** @var resource|CurlHandle|null */
     private $curlHandle = null;
 
     /** @var LoggerInterface */
@@ -59,9 +60,6 @@ class SseTransport {
 
     /** @var string|null */
     private ?string $endpoint = null;
-
-    /** @var array<string> */
-    private array $headers = [];
 
     /**
      * SseTransport constructor.
@@ -103,32 +101,68 @@ class SseTransport {
             throw new RuntimeException('Failed to initialize cURL');
         }
 
-        curl_setopt_array($this->curlHandle, [
-            CURLOPT_URL => $this->url,
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_HEADER => false,
-            CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_HTTPHEADER => array_merge([
-                'Accept: text/event-stream',
-                'Cache-Control: no-cache',
-            ], $this->formatHeaders($this->headers)),
-            CURLOPT_TIMEOUT => $this->sseReadTimeout,
-            CURLOPT_CONNECTTIMEOUT => $this->timeout,
-            CURLOPT_WRITEFUNCTION => [$this, 'handleCurlWrite'],
-        ]);
-
         // Initialize eventStream as a temporary in-memory stream
         $this->eventStream = fopen('php://temp', 'r+');
         if ($this->eventStream === false) {
             throw new RuntimeException('Failed to create event stream buffer');
         }
 
-        // Execute cURL in non-blocking mode
-        curl_setopt($this->curlHandle, CURLOPT_TIMEOUT_MS, (int)($this->sseReadTimeout * 1000));
-        $exec = curl_exec($this->curlHandle);
-        if ($exec === false) {
+        curl_setopt_array($this->curlHandle, [
+            CURLOPT_URL => $this->url,
+            CURLOPT_RETURNTRANSFER => false, // Changed to false since we're using a write callback
+            CURLOPT_HEADER => false,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTPHEADER => array_merge([
+                'Accept: text/event-stream',
+                'Cache-Control: no-cache',
+            ], $this->formatHeaders($this->headers)),
+            CURLOPT_TIMEOUT => 0, // No timeout for the connection
+            CURLOPT_CONNECTTIMEOUT => $this->timeout,
+            CURLOPT_WRITEFUNCTION => [$this, 'handleCurlWrite'],
+            CURLOPT_NOSIGNAL => true, // Prevent SIGALRM issues
+            CURLOPT_TCP_NODELAY => true, // Disable Nagle's algorithm
+        ]);
+
+        // Start the connection asynchronously
+        $mh = curl_multi_init();
+        curl_multi_add_handle($mh, $this->curlHandle);
+        
+        // Do initial read
+        $active = null;
+        $running = null;
+        do {
+            $status = curl_multi_exec($mh, $running);
+            if ($running) {
+                // Wait for activity on the connection
+                $res = curl_multi_select($mh, 0.1); // 100ms timeout
+                if ($res === -1) {
+                    // Error occurred, but we can continue
+                    usleep(100000); // Sleep for 100ms
+                }
+            }
+            
+            // Check if we've received the initial response
+            $info = curl_getinfo($this->curlHandle);
+            if ($info['http_code'] > 0) {
+                // We've received headers, connection is established
+                break;
+            }
+        } while ($running && $status === CURLM_OK);
+
+        // Check for connection errors
+        if ($status !== CURLM_OK) {
             $error = curl_error($this->curlHandle);
+            curl_multi_remove_handle($mh, $this->curlHandle);
+            curl_multi_close($mh);
             throw new RuntimeException("cURL error while connecting: $error");
+        }
+
+        // Check HTTP response code
+        $httpCode = curl_getinfo($this->curlHandle, CURLINFO_HTTP_CODE);
+        if ($httpCode < 200 || $httpCode >= 300) {
+            curl_multi_remove_handle($mh, $this->curlHandle);
+            curl_multi_close($mh);
+            throw new RuntimeException("HTTP error while connecting: $httpCode");
         }
 
         $this->logger->info('Connected to SSE endpoint successfully.');
@@ -246,14 +280,17 @@ class SseTransport {
             }
         };
 
-        $writeStream = new class($this->curlHandle, $this->logger) extends MemoryStream {
+        $writeStream = new class($this->curlHandle, $this->logger, $this->url, $this->headers) extends MemoryStream {
             private $curlHandle;
             private LoggerInterface $logger;
+            private string $endpoint;
+            private array $headers;
 
-            public function __construct($curlHandle, LoggerInterface $logger) {
+            public function __construct($curlHandle, LoggerInterface $logger, string $endpoint, array $headers) {
                 $this->curlHandle = $curlHandle;
                 $this->logger = $logger;
-                // Removed parent::__construct();
+                $this->endpoint = $endpoint;
+                $this->headers = $headers;
             }
 
             /**
@@ -317,14 +354,19 @@ class SseTransport {
                     throw new RuntimeException('Failed to initialize cURL for sending message.');
                 }
 
+                $formattedHeaders = [];
+                foreach ($this->headers as $name => $value) {
+                    $formattedHeaders[] = "$name: $value";
+                }
+
                 curl_setopt_array($ch, [
-                    CURLOPT_URL => $this->getEndpoint(),
+                    CURLOPT_URL => $this->endpoint,
                     CURLOPT_RETURNTRANSFER => true,
                     CURLOPT_POST => true,
                     CURLOPT_POSTFIELDS => $json,
                     CURLOPT_HTTPHEADER => array_merge([
                         'Content-Type: application/json',
-                    ], $this->getFormattedHeaders()),
+                    ], $formattedHeaders),
                     CURLOPT_TIMEOUT => 10.0,
                 ]);
 
@@ -351,19 +393,18 @@ class SseTransport {
     }
 
     /**
-     * Handles writing data received from cURL to the eventStream.
+     * Handle cURL write callback for SSE data.
      *
-     * @param resource $ch     The cURL handle.
-     * @param string   $data   The data chunk received.
-     * @param int      $length The length of the data.
-     *
-     * @return int The number of bytes handled.
+     * @param resource $ch   The cURL handle
+     * @param string   $data The received data
+     * @return int The number of bytes written
      */
-    public function handleCurlWrite($ch, string $data, int $length): int {
-        if ($this->eventStream !== null && is_resource($this->eventStream)) {
-            fwrite($this->eventStream, $data);
+    public function handleCurlWrite($ch, string $data): int {
+        if ($this->eventStream === null) {
+            return 0;
         }
-        return $length;
+        
+        return fwrite($this->eventStream, $data);
     }
 
     /**

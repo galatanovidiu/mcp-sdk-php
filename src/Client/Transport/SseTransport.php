@@ -280,7 +280,7 @@ class SseTransport {
             }
         };
 
-        $writeStream = new class($this->curlHandle, $this->logger, $this->url, $this->headers) extends MemoryStream {
+        $writeStream = new class($this->curlHandle, $this->logger, $this->endpoint, $this->headers) extends MemoryStream {
             private $curlHandle;
             private LoggerInterface $logger;
             private string $endpoint;
@@ -400,6 +400,16 @@ class SseTransport {
      * @return int The number of bytes written
      */
     public function handleCurlWrite($ch, string $data): int {
+        // The first message from the server is going to be the address of the messages endpointUrl which should end up as $this->endpoint
+		// TODO: better request matching to catch the event: endpoint.
+        if (preg_match('/data: (\/messages\?sessionId=[a-f0-9-]+)/', $data, $matches)) {
+			$messagesUrl = $matches[1];
+			$this->logger->debug('Received messages URL: ' . $messagesUrl);
+            // TODO: Normalization inside setEndpoint.
+            $this->setEndpoint("http://host.docker.internal:3000" . $messagesUrl);
+			return strlen($data);
+		}
+
         if ($this->eventStream === null) {
             return 0;
         }
